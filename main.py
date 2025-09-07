@@ -9,10 +9,10 @@ Buys only: GLD, BND, VNQ
 Sells (never sell VIG):
   SELL (15m): RSI(14) >= 70 AND SMA(60,15m) > SMA(240,15m)
               AND last_price >= avg_entry_price * (1 + MIN_PROFIT_PCT)
-    - Sells SELL_FRACTION (default 5%) of current position (notional)
+    - Sells SELL_FRACTION (default 5%) of the current position (notional)
 
 Notes:
-- Aligns execution to closed 15m bars (:00/:15/:30/:45 + RUN_DELAY_SEC) in America/New_York
+- Aligns execution to CLOSED 15m bars (:00/:15/:30/:45 + RUN_DELAY_SEC) in America/New_York
 - Uses Alpaca positions' avg_entry_price for profit gate
 - Uses notional orders for both buys and sells
 """
@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 from zoneinfo import ZoneInfo
 
-from alpaca_trade_api.rest import REST, TimeFrame
+from alpaca_trade_api.rest import REST  # using alpaca_trade_api (your working stack)
 
 # ===== Config (env) =====
 BUY_SYMBOLS        = os.getenv("BUY_SYMBOLS", "GLD,BND,VNQ").split(",")
@@ -32,17 +32,17 @@ NEVER_SELL         = set((os.getenv("NEVER_SELL", "VIG") or "VIG").split(","))
 RSI_LEN            = int(os.getenv("RSI_LEN", "14"))
 RSI_BUY_THRESH     = float(os.getenv("RSI_BUY_THRESH", "30"))
 RSI_SELL_THRESH    = float(os.getenv("RSI_SELL_THRESH", "70"))
-SMA_FAST_LEN       = int(os.getenv("SMA_FAST_LEN", "60"))      # 60 x 15m
-SMA_SLOW_LEN       = int(os.getenv("SMA_SLOW_LEN", "240"))     # 240 x 15m
-MIN_PROFIT_PCT     = float(os.getenv("MIN_PROFIT_PCT", "0.05"))# 5%
-BUY_FRACTION       = float(os.getenv("BUY_FRACTION", "0.10"))  # 10% bp per buy
-SELL_FRACTION      = float(os.getenv("SELL_FRACTION", "0.05")) # 5% of position (notional)
-DATA_FEED          = os.getenv("DATA_FEED", "iex").lower()     # 'iex' or 'sip'
+SMA_FAST_LEN       = int(os.getenv("SMA_FAST_LEN", "60"))       # 60 x 15m
+SMA_SLOW_LEN       = int(os.getenv("SMA_SLOW_LEN", "240"))      # 240 x 15m
+MIN_PROFIT_PCT     = float(os.getenv("MIN_PROFIT_PCT", "0.05")) # 5%
+BUY_FRACTION       = float(os.getenv("BUY_FRACTION", "0.10"))   # 10% bp per buy
+SELL_FRACTION      = float(os.getenv("SELL_FRACTION", "0.05"))  # 5% of position (notional)
+DATA_FEED          = os.getenv("DATA_FEED", "iex").lower()      # 'iex' or 'sip'
 ALIGN_TZ           = os.getenv("ALIGN_TZ", "America/New_York")
 RUN_DELAY_SEC      = int(os.getenv("RUN_DELAY_SEC", "5"))
 
 # History knobs
-HISTORY_DAYS_15M   = int(os.getenv("HISTORY_DAYS_15M", "120"))  # ensure we can get >=240 bars
+HISTORY_DAYS_15M   = int(os.getenv("HISTORY_DAYS_15M", "120"))  # ensures >= 240 bars available
 BAR_LIMIT_MAX      = int(os.getenv("BAR_LIMIT_MAX", "10000"))
 
 # Alpaca creds
@@ -87,57 +87,63 @@ def sma(closes: List[float], length: int) -> float:
         return float("nan")
     return sum(closes[-length:]) / float(length)
 
-# ===== Data helpers =====
-def fetch_closed_15m_closes(symbol: str) -> tuple[list[float], Optional[datetime]]:
+# ===== Data helpers (native 15m bars, proper UTC handling) =====
+def _ensure_utc_index(sym_df):
     """
-    Fetch closed 15m bars for symbol (oldest->newest). Drops the forming bar.
-    Returns (closes, last_bar_start_utc)
+    Ensure DataFrame index is tz-aware UTC without shifting wall time.
+    Alpaca df is typically tz-aware UTC; if not, localize to UTC.
     """
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=HISTORY_DAYS_15M)
+    idx = sym_df.index
+    if getattr(idx, "tz", None) is None:
+        sym_df.index = idx.tz_localize("UTC")
+    else:
+        sym_df.index = idx.tz_convert("UTC")
+    return sym_df
+
+def fetch_closed_15m_closes(symbol: str):
+    """
+    Fetch CLOSED 15m bars (oldest->newest) directly from Alpaca.
+    Drops a potentially forming last bar. Returns (closes, last_bar_start_utc).
+    """
+    now_utc = datetime.now(timezone.utc)
+    start = now_utc - timedelta(days=HISTORY_DAYS_15M)
 
     bars = api.get_bars(
         symbol,
-        TimeFrame.Minute,  # will filter to 15m via slice below
+        "15Min",                    # native 15m bars, no resampling
         start=start.isoformat(),
-        end=now.isoformat(),
+        end=now_utc.isoformat(),
         adjustment="raw",
         feed=DATA_FEED,
         limit=BAR_LIMIT_MAX,
     )
+
     df = getattr(bars, "df", None)
     if df is None or df.empty:
         return [], None
 
-    # If MultiIndex, slice symbol; else assume single index
+    # MultiIndex(df) when multiple symbols; handle both cases
     try:
         sym_df = df.xs(symbol, level=0)
     except Exception:
         sym_df = df
 
+    if sym_df.empty:
+        return [], None
+
     sym_df = sym_df.sort_index()
+    sym_df = _ensure_utc_index(sym_df)
 
-    # Resample to 15-minute bars in case the feed returns 1m
-    try:
-        # Keep OHLCV shape consistent; use last for close
-        r = sym_df.resample("15T").agg({
-            "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
-        }).dropna()
-        sym_df = r
-    except Exception:
-        # If already 15m from the feed, continue
-        pass
-
-    # Drop forming bar (bar timestamps are start times)
-    cutoff = now - timedelta(minutes=15)
-    if not sym_df.empty and sym_df.index[-1].to_pydatetime().replace(tzinfo=timezone.utc) > cutoff:
+    # Drop forming bar: keep only bars whose start + 15m <= now
+    cutoff = now_utc - timedelta(minutes=15)
+    if not sym_df.empty and sym_df.index[-1] > cutoff:
         sym_df = sym_df.iloc[:-1]
 
     if sym_df.empty:
         return [], None
 
     closes = sym_df["close"].astype(float).tolist()
-    last_start = sym_df.index[-1].to_pydatetime().replace(tzinfo=timezone.utc)
+    last_start = sym_df.index[-1].to_pydatetime()  # tz-aware UTC datetime
     return closes, last_start
 
 def get_buying_power_usd() -> float:
@@ -155,7 +161,7 @@ def get_positions_map() -> Dict[str, dict]:
     for p in api.list_positions():
         sym = p.symbol
         out[sym] = {
-            "qty": float(p.qty) if hasattr(p, "qty") else float(p.qty_available),
+            "qty": float(p.qty) if hasattr(p, "qty") else float(getattr(p, "qty_available", 0.0)),
             "avg_entry_price": float(p.avg_entry_price) if p.avg_entry_price else float("nan"),
             "market_value": float(p.market_value) if p.market_value else 0.0,
         }
@@ -241,7 +247,6 @@ def main():
             log(f"Status | buying_power=${buying_power:.2f} | positions={list(pos.keys())}")
 
             # ------- SELL checks (all positions except NEVER_SELL) -------
-            # Evaluate with same 15m indicators per symbol
             for sym, pdata in pos.items():
                 if sym in NEVER_SELL:
                     continue
@@ -259,7 +264,6 @@ def main():
                 if sell_signal_15m(closes):
                     need = avg * (1.0 + float(MIN_PROFIT_PCT))
                     if px >= need:
-                        # Notional amount to sell = SELL_FRACTION * current market value
                         mv = pdata.get("market_value", 0.0)
                         notional = max(0.0, mv * SELL_FRACTION)
                         if notional > 0:
@@ -290,7 +294,7 @@ def main():
                     notional = buying_power * BUY_FRACTION
                     if notional > 0:
                         submit_notional_buy(sym, notional)
-                        # Update our local view of buying power optimistically
+                        # Update local view of buying power optimistically
                         buying_power = max(0.0, buying_power - notional)
                 last_seen_bar[sym] = last_15
 
